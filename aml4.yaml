@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Resources:
+  ### S3 Bucket for Static Website Hosting ###
+  MyCaffeBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: "mycaffe1234"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: "BucketOwnerEnforced"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      VersioningConfiguration:
+        Status: "Suspended"
+      WebsiteConfiguration:
+        IndexDocument: "index.html"
+
+  MyCaffeBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref MyCaffeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "PublicReadGetObject"
+            Effect: "Allow"
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::mycaffe/*"
+
+  ### DynamoDB Table ###
+  ContactsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Contacts
+      AttributeDefinitions:
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: timestamp
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ### IAM Role for Lambda ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ContactsTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !GetAtt ContactsTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  ### Lambda Function to Save Contact Info ###
+  AddContactInfoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AddContactInfo
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              db = boto3.resource('dynamodb')
+              table = db.Table('Contacts')
+              dateTime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+              try:
+                  payload = json.loads(event['body'])
+                  table.put_item(
+                      Item={
+                          'timestamp': dateTime,
+                          'name': payload['name'],
+                          'email': payload['email'],
+                          'message': payload['msg']
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully saved contact info!'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Credentials": True,
+                      }
+                  }
+              except Exception as e:
+                  print(e)
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Error saving contact info'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Credentials": True,
+                      }
+                  }
+
+  ### Lambda Function to Send Email ###
+  SendContactInfoEmailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SendContactInfoEmail
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('Contacts')
+
+              result = table.scan()
+              items = result['Items']
+
+              ses = boto3.client('ses')
+              body = "Contact Information:\n\n" + "\n".join(
+                  [f"Name: {item['name']}, Email: {item['email']}, Message: {item['message']}" for item in items]
+              )
+
+              try:
+                  ses.send_email(
+                      Source='Omarzhouri@outlook.com',
+                      Destination={
+                          'ToAddresses': ['Omarzhourijobb@outlook.com']
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': 'New Contact Info Notification',
+                              'Charset': 'UTF-8'
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': body,
+                                  'Charset': 'UTF-8'
+                              }
+                          }
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Email sent successfully!')
+                  }
+              except Exception as e:
+                  print(e)
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Failed to send email')
+                  }
+
+  ### Trigger: DynamoDB Stream to SendContactInfoEmail ###
+  ContactsTableStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 5
+      EventSourceArn: !GetAtt ContactsTable.StreamArn
+      FunctionName: !GetAtt SendContactInfoEmailLambda.Arn
+      StartingPosition: TRIM_HORIZON
+
+  ### API Gateway for Lambda Integration ###
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ContactAPI
+
+  GatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: addContactInfo
+      RestApiId: !Ref APIGateway
+
+  PostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref GatewayResource
+      RestApiId: !Ref APIGateway
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddContactInfoLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ### Trigger: API Gateway to AddContactInfo Lambda ###
+  LambdaPermissionForApiGateway:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AddContactInfoLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/POST/addContactInfo
+
+Outputs:
+  BucketWebsiteEndpoint:
+    Value: !GetAtt MyCaffeBucket.WebsiteURL
+    Description: "The website endpoint for the S3 bucket."
